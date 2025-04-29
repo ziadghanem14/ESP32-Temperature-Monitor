@@ -1,0 +1,140 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+
+// WiFi
+const char* ssid = "montafe";
+const char* password = "12345678";
+
+// Telegram
+String botToken = "7524768148:AAFF1OZt8nSSv0L7FpRgZiIR2WYqU8U0Yqs";
+String chatID = "5182923617";
+
+// DHT
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// LEDs
+#define RED_LED 25
+#define GREEN_LED 26
+#define BLUE_LED 27
+
+// Buzzer
+#define BUZZER_PIN 14
+
+String lastAlert = "";
+
+void setup() {
+  Serial.begin(115200);
+  
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.println("\nConnecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nConnected!");
+
+  // DHT
+  dht.begin();
+
+  // LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("System Started");
+
+  // LEDs
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Send Start Message
+  sendTelegramMessage("✅ System Started Successfully!");
+}
+
+void loop() {
+  float temperature = dht.readTemperature();
+
+  if (isnan(temperature)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;
+  }
+
+  // Display Temperature on LCD
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Temp: ");
+  lcd.print(temperature);
+  lcd.print((char)223);
+  lcd.print("C");
+
+  String currentAlert = "";
+
+  if (temperature < 20) {
+    // Cold
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BLUE_LED, LOW);
+    tone(BUZZER_PIN, 1000, 1000); // صوت منخفض لكنه بأقصى صوت
+    currentAlert = "🧣 It's quite cold (" + String(temperature) + "°C)! Turn on a heater.";
+    lcd.setCursor(0,1);
+    lcd.print("Turn on heater!");
+
+  } else if (temperature > 30) {
+    // Hot
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BLUE_LED, HIGH);
+    tone(BUZZER_PIN, 3000, 1000); // صوت عالي وتردد أعلى
+    currentAlert = "🥵 It's getting hot (" + String(temperature) + "°C)! Turn on air conditioner.";
+    lcd.setCursor(0,1);
+    lcd.print("Turn on AC!");
+
+  } else {
+    // Ideal
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(BLUE_LED, LOW);
+    noTone(BUZZER_PIN); // مفيش صوت
+    lcd.setCursor(0,1);
+    lcd.print("Pleasant weather");
+    currentAlert = ""; // مفيش تنبيه يبعت
+  }
+
+  // Send Alert only if it's different and not empty
+  if (currentAlert != lastAlert && currentAlert != "") {
+    sendTelegramMessage(currentAlert);
+    lastAlert = currentAlert;
+  }
+
+  delay(5000); // كل 5 ثواني
+}
+
+void sendTelegramMessage(String message) {
+  if(WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + botToken + "/sendMessage?chat_id=" + chatID + "&text=" + message;
+    http.begin(url);
+    int httpCode = http.GET();
+    if(httpCode > 0) {
+      Serial.println("Telegram message sent successfully!");
+    } else {
+      Serial.println("Error sending Telegram message.");
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
+}
