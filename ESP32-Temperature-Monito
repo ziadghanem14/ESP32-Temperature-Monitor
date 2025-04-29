@@ -2,6 +2,9 @@
 #include <HTTPClient.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
+#include <UniversalTelegramBot.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 
 // WiFi
 const char* ssid = "montafe";
@@ -17,7 +20,7 @@ String chatID = "5182923617";
 DHT dht(DHTPIN, DHTTYPE);
 
 // LCD
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+LiquidCrystal_I2C lcd(0x27, 12, 2);  // تغيير العرض إلى 12 عمودًا
 
 // LEDs
 #define RED_LED 25
@@ -27,11 +30,25 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 // Buzzer
 #define BUZZER_PIN 14
 
-String lastAlert = "";
+// Control Buzzer from Telegram
+bool buzzerState = true;  // Default buzzer state is ON
+
+// Telegram bot object
+WiFiClientSecure client;
+UniversalTelegramBot bot(botToken, client);
+
+// Bot check timing
+unsigned long botLastTime = 0;
+const unsigned long BOT_INTERVAL = 1000; // Check for new messages every second
+
+// Timing for reading temperature and humidity
+unsigned long previousMillis = 0;
+const long interval = 500;  // 500 ms (half second) between each reading
+String lastAlert = "";  // Track last alert to avoid duplicates
 
 void setup() {
   Serial.begin(115200);
-  
+
   // WiFi
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -42,6 +59,10 @@ void setup() {
   }
   Serial.println("\nConnected!");
 
+  // Allow insecure connections for Telegram API (only for development)
+  client.setCACert(NULL);
+  client.setInsecure();
+
   // DHT
   dht.begin();
 
@@ -49,7 +70,7 @@ void setup() {
   lcd.init();
   lcd.backlight();
   lcd.clear();
-  lcd.setCursor(0,0);
+  lcd.setCursor(0, 0);
   lcd.print("System Started");
 
   // LEDs
@@ -65,20 +86,40 @@ void setup() {
 }
 
 void loop() {
-  float temperature = dht.readTemperature();
+  unsigned long currentMillis = millis();
 
-  if (isnan(temperature)) {
+  // Check temperature and humidity readings (every half second)
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    checkTemperature();
+  }
+
+  // Check for new Telegram messages (every second)
+  if (currentMillis - botLastTime > BOT_INTERVAL) {
+    botLastTime = currentMillis;
+    checkNewMessages();
+  }
+}
+
+void checkTemperature() {
+  // Read temperature and humidity
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
     Serial.println("Failed to read from DHT sensor!");
     return;
   }
 
-  // Display Temperature on LCD
+  // Display Temperature and Humidity on LCD without decimal places in the same line
   lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Temp: ");
-  lcd.print(temperature);
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print((int)temperature); // Convert to integer
   lcd.print((char)223);
-  lcd.print("C");
+  lcd.print("C  H:");
+  lcd.print((int)humidity); // Convert to integer
+  lcd.print("%");
 
   String currentAlert = "";
 
@@ -87,9 +128,9 @@ void loop() {
     digitalWrite(RED_LED, HIGH);
     digitalWrite(GREEN_LED, LOW);
     digitalWrite(BLUE_LED, LOW);
-    tone(BUZZER_PIN, 1000, 1000); // صوت منخفض لكنه بأقصى صوت
-    currentAlert = "🧣 It's quite cold (" + String(temperature) + "°C)! Turn on a heater.";
-    lcd.setCursor(0,1);
+    if (buzzerState) tone(BUZZER_PIN, 1000, 1000);  // Low tone
+    currentAlert = "🧣 It's cold (" + String((int)temperature) + "°C)! Turn on heater.";
+    lcd.setCursor(0, 1);
     lcd.print("Turn on heater!");
 
   } else if (temperature > 30) {
@@ -97,9 +138,9 @@ void loop() {
     digitalWrite(RED_LED, LOW);
     digitalWrite(GREEN_LED, LOW);
     digitalWrite(BLUE_LED, HIGH);
-    tone(BUZZER_PIN, 3000, 1000); // صوت عالي وتردد أعلى
-    currentAlert = "🥵 It's getting hot (" + String(temperature) + "°C)! Turn on air conditioner.";
-    lcd.setCursor(0,1);
+    if (buzzerState) tone(BUZZER_PIN, 3000, 1000);  // High tone
+    currentAlert = "🥵 It's hot (" + String((int)temperature) + "°C)! Turn on AC.";
+    lcd.setCursor(0, 1);
     lcd.print("Turn on AC!");
 
   } else {
@@ -107,34 +148,76 @@ void loop() {
     digitalWrite(RED_LED, LOW);
     digitalWrite(GREEN_LED, HIGH);
     digitalWrite(BLUE_LED, LOW);
-    noTone(BUZZER_PIN); // مفيش صوت
-    lcd.setCursor(0,1);
+    noTone(BUZZER_PIN);  // No sound
+    lcd.setCursor(0, 1);
     lcd.print("Pleasant weather");
-    currentAlert = ""; // مفيش تنبيه يبعت
+    currentAlert = "";  // No alert to send
   }
 
   // Send Alert only if it's different and not empty
-  if (currentAlert != lastAlert && currentAlert != "") {
+  if (currentAlert != "" && currentAlert != lastAlert) {
     sendTelegramMessage(currentAlert);
-    lastAlert = currentAlert;
+    lastAlert = currentAlert;  // Update last alert
   }
-
-  delay(5000); // كل 5 ثواني
 }
 
+void checkNewMessages() {
+  int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+    
+    // Only process messages from authorized users
+    if (chat_id == chatID) {
+      handleTelegramCommand(text);
+    }
+  }
+}
+
+// Function to send Telegram message
 void sendTelegramMessage(String message) {
-  if(WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    String url = "https://api.telegram.org/bot" + botToken + "/sendMessage?chat_id=" + chatID + "&text=" + message;
-    http.begin(url);
-    int httpCode = http.GET();
-    if(httpCode > 0) {
+  if (WiFi.status() == WL_CONNECTED) {
+    bool messageSent = bot.sendMessage(chatID, message, "");
+    if (messageSent) {
       Serial.println("Telegram message sent successfully!");
     } else {
       Serial.println("Error sending Telegram message.");
     }
-    http.end();
   } else {
     Serial.println("WiFi Disconnected");
+  }
+}
+
+// Function to handle Telegram commands like /buzzer_on, /status, etc.
+void handleTelegramCommand(String command) {
+  if (command == "/buzzer_on") {
+    buzzerState = true;
+    sendTelegramMessage("🔔 Buzzer is now ON");
+  } else if (command == "/buzzer_off") {
+    buzzerState = false;
+    noTone(BUZZER_PIN);  // Make sure to turn off immediately
+    sendTelegramMessage("🔕 Buzzer is now OFF");
+  } else if (command == "/status") {
+    // Show current temperature and humidity status
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    
+    String statusMessage = "📊 Status:\n";
+    statusMessage += "Temp: " + String((int)temperature) + "C\n";
+    statusMessage += "Hum: " + String((int)humidity) + "%\n";
+    statusMessage += "Buzzer: " + String(buzzerState ? "ON" : "OFF");
+    
+    sendTelegramMessage(statusMessage);
+  } else if (command == "/help") {
+    String helpMessage = "Available commands:\n";
+    helpMessage += "/status - Get current readings\n";
+    helpMessage += "/buzzer_on - Turn alert buzzer on\n";
+    helpMessage += "/buzzer_off - Turn alert buzzer off\n";
+    helpMessage += "/help - Show this help";
+    
+    sendTelegramMessage(helpMessage);
+  } else {
+    sendTelegramMessage("Unknown command. Type /help for available commands.");
   }
 }
